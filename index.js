@@ -2,68 +2,202 @@
  * Knight Bot - A WhatsApp Bot
  * Copyright (c) 2024 Professor
  * 
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the MIT License.
+ * Licensed under the MIT License.
  * 
  * Credits:
  * - Baileys Library by @adiwajshing
  * - Pair Code implementation inspired by TechGod143 & DGXEON
  */
-require('./settings')
-const { Boom } = require('@hapi/boom')
-const fs = require('fs')
-const chalk = require('chalk')
-const FileType = require('file-type')
-const path = require('path')
-const axios = require('axios')
+
+require('./settings');
+const { Boom } = require('@hapi/boom');
+const fs = require('fs');
+const chalk = require('chalk');
+const path = require('path');
+const NodeCache = require('node-cache');
+const pino = require('pino');
+const readline = require('readline');
+const axios = require('axios');
+const PhoneNumber = require('awesome-phonenumber');
+
 const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main');
-const PhoneNumber = require('awesome-phonenumber')
-const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('./lib/exif')
-const { smsg, isUrl, generateMessageTag, getBuffer, getSizeMedia, fetch, await, sleep, reSize } = require('./lib/myfunc')
+const { smsg, sleep } = require('./lib/myfunc');
+const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('./lib/exif');
+const { rmSync } = require('fs');
+const { join } = require('path');
+
+// --- Baileys Imports ---
 const {
     default: makeWASocket,
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
-    generateForwardMessageContent,
-    prepareWAMessageMedia,
-    generateWAMessageFromContent,
-    generateMessageID,
-    downloadContentFromMessage,
     jidDecode,
-    proto,
     jidNormalizedUser,
     makeCacheableSignalKeyStore,
     delay
-} = require("@whiskeysockets/baileys")
-const NodeCache = require("node-cache")
-// Using a lightweight persisted store instead of makeInMemoryStore (compat across versions)
-const pino = require("pino")
-const readline = require("readline")
-const { parsePhoneNumber } = require("libphonenumber-js")
-const { PHONENUMBER_MCC } = require('@whiskeysockets/baileys/lib/Utils/generics')
-const { rmSync, existsSync } = require('fs')
-const { join } = require('path')
+} = require("@whiskeysockets/baileys");
 
-// Import lightweight store
-const store = require('./lib/lightweight_store')
+// --- Lightweight Store ---
+const store = require('./lib/lightweight_store');
+store.readFromFile();
 
-// Initialize store
-store.readFromFile()
-const settings = require('./settings')
-setInterval(() => store.writeToFile(), settings.storeWriteInterval || 10000)
+const settings = require('./settings');
+setInterval(() => store.writeToFile(), settings.storeWriteInterval || 10000);
 
-// Memory optimization - Force garbage collection if available
+// --- Garbage Collector ---
 setInterval(() => {
     if (global.gc) {
-        global.gc()
-        console.log('🧹 Garbage collection completed')
+        global.gc();
+        console.log('🧹 Garbage collection completed');
     }
-}, 60_000) // every 1 minute
+}, 60000);
 
-// Memory monitoring - Restart if RAM gets too high
+// --- RAM Monitor ---
 setInterval(() => {
-    const used = process.memoryUsage().rss / 1024 / 1024
+    const used = process.memoryUsage().rss / 1024 / 1024;
+    if (used > 400) {
+        console.log('⚠️ RAM too high (>400MB), restarting bot...');
+        process.exit(1);
+    }
+}, 30000);
+
+// --- Global Settings ---
+let phoneNumber = "911234567890";
+let owner = JSON.parse(fs.readFileSync('./data/owner.json', 'utf8'));
+
+global.botname = "KNIGHT BOT";
+global.themeemoji = "•";
+const pairingCode = process.argv.includes("--pairing-code");
+const useMobile = process.argv.includes("--mobile");
+
+// --- Readline for Pairing Code Input ---
+const rl = process.stdin.isTTY ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null;
+const question = (text) => rl ? new Promise((resolve) => rl.question(text, resolve)) : Promise.resolve(settings.ownerNumber || phoneNumber);
+
+// --- Main Function ---
+async function startKnightBot() {
+    const { version } = await fetchLatestBaileysVersion();
+    const { state, saveCreds } = await useMultiFileAuthState(`./session`);
+    const msgRetryCounterCache = new NodeCache();
+
+    const sock = makeWASocket({
+        version,
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: !pairingCode,
+        browser: ["KnightBot", "Chrome", "1.0.0"],
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }))
+        },
+        markOnlineOnConnect: true,
+        generateHighQualityLinkPreview: true,
+        syncFullHistory: true,
+        msgRetryCounterCache,
+        defaultQueryTimeoutMs: undefined,
+        getMessage: async (key) => {
+            let jid = jidNormalizedUser(key.remoteJid);
+            let msg = await store.loadMessage(jid, key.id);
+            return msg?.message || "";
+        }
+    });
+
+    store.bind(sock.ev);
+    sock.public = true;
+
+    // --- Message Handling ---
+    sock.ev.on('messages.upsert', async (chatUpdate) => {
+        try {
+            const mek = chatUpdate.messages?.[0];
+            if (!mek?.message) return;
+
+            mek.message = mek.message?.ephemeralMessage?.message || mek.message;
+
+            if (mek.key?.remoteJid === 'status@broadcast') {
+                await handleStatus(sock, chatUpdate);
+                return;
+            }
+
+            if (!sock.public && !mek.key.fromMe && chatUpdate.type === 'notify') return;
+            if (mek.key.id.startsWith('BAE5') && mek.key.id.length === 16) return;
+
+            sock.msgRetryCounterCache?.clear();
+            await handleMessages(sock, chatUpdate, true);
+
+        } catch (err) {
+            console.error("Error in message handler:", err);
+            if (chatUpdate.messages?.[0]?.key?.remoteJid) {
+                await sock.sendMessage(chatUpdate.messages[0].key.remoteJid, { text: '❌ Error processing your message.' });
+            }
+        }
+    });
+
+    // --- Connection Updates ---
+    sock.ev.on('connection.update', async (s) => {
+        const { connection, lastDisconnect } = s;
+
+        if (connection === "open") {
+            console.log(chalk.greenBright(`✅ Connected as ${sock.user?.name || sock.user?.id}`));
+
+            const botNumber = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+            await sock.sendMessage(botNumber, {
+                text: `🤖 Knight Bot Connected!\n\nTime: ${new Date().toLocaleString()}\nStatus: Online ✅`
+            });
+
+            console.log(chalk.cyan(`\n🌿 Knight Bot is running...\nYT: MR UNIQUE HACKER\nGITHUB: mrunqiuehacker`));
+        }
+
+        if (connection === "close") {
+            const reason = lastDisconnect?.error?.output?.statusCode;
+            if (reason === DisconnectReason.loggedOut || reason === 401) {
+                rmSync('./session', { recursive: true, force: true });
+                console.log(chalk.red('Session logged out. Restarting...'));
+                startKnightBot();
+            } else {
+                console.log(chalk.yellow('Reconnecting...'));
+                startKnightBot();
+            }
+        }
+    });
+
+    // --- Group Participant Updates ---
+    sock.ev.on('group-participants.update', async (update) => {
+        await handleGroupParticipantUpdate(sock, update);
+    });
+
+    // --- Status Handling ---
+    sock.ev.on('status.update', async (status) => {
+        await handleStatus(sock, status);
+    });
+
+    sock.ev.on('messages.reaction', async (reaction) => {
+        await handleStatus(sock, reaction);
+    });
+
+    // --- Save Creds ---
+    sock.ev.on('creds.update', saveCreds);
+
+    return sock;
+}
+
+// --- Start Bot ---
+startKnightBot().catch((err) => {
+    console.error("Fatal error:", err);
+    process.exit(1);
+});
+
+// --- Error Handling ---
+process.on('uncaughtException', console.error);
+process.on('unhandledRejection', console.error);
+
+// --- Hot Reload ---
+const file = require.resolve(__filename);
+fs.watchFile(file, () => {
+    fs.unwatchFile(file);
+    console.log(chalk.redBright(`File updated: ${__filename}`));
+    delete require.cache[file];
+    require(file);
+});    const used = process.memoryUsage().rss / 1024 / 1024
     if (used > 400) {
         console.log('⚠️ RAM too high (>400MB), restarting bot...')
         process.exit(1) // Panel will auto-restart
